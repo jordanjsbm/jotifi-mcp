@@ -17,7 +17,7 @@ function getPreviousMonth(yyyyMM) {
   return `${year}-${String(month).padStart(2, "0")}`;
 }
 
-function formatCOP(val) {
+export function formatCOP(val) {
   const num = Number(val) || 0;
   return new Intl.NumberFormat("es-CO", {
     style: "currency",
@@ -29,7 +29,7 @@ function formatCOP(val) {
 /**
  * Carga los datos completos del usuario desde Firestore (idéntico al flujo de App.jsx)
  */
-async function loadUserFinancialContext(idToken, uid, targetMonth) {
+export async function loadUserFinancialContext(idToken, uid, targetMonth) {
   const month = targetMonth || getCurrentYYYYMM();
   const [userSnap, monthSnap] = await Promise.all([
     getFirestoreDoc(`userData/${uid}`, idToken),
@@ -110,30 +110,14 @@ async function loadUserFinancialContext(idToken, uid, targetMonth) {
 }
 
 /**
- * Crea una instancia del servidor MCP de JotiFi vinculada al token de sesión (o multitenant por request)
+ * Ejecuta cualquiera de las 7 herramientas financieras de JotiFi (usado tanto por MCP como por el Bot de WhatsApp)
  */
-export function createJotifiMcpServer(getDefaultToken) {
-  const server = new McpServer({
-    name: "jotifi-mcp",
-    version: "1.0.0"
-  });
+export async function executeJotifiTool(toolName, args = {}, rawToken) {
+  const { idToken, uid } = await authenticateUser(rawToken);
 
-  async function resolveSession(explicitToken) {
-    const token = explicitToken || (typeof getDefaultToken === "function" ? getDefaultToken() : getDefaultToken) || process.env.JOTIFI_TOKEN;
-    return authenticateUser(token);
-  }
-
-  // 1. Resumen Financiero Completo
-  server.tool(
-    "jotifi_resumen_financiero",
-    "Obtiene el resumen financiero completo del usuario en JotiFi: ingresos mensuales, bolsillos y sus gastos (pagados/pendientes), deudas globales, gastos compartidos y préstamos.",
-    {
-      month: z.string().optional().describe("Mes a consultar en formato YYYY-MM (por defecto el mes actual)")
-    },
-    async ({ month }) => {
-      const { idToken, uid } = await resolveSession();
-      const ctx = await loadUserFinancialContext(idToken, uid, month);
-
+  switch (toolName) {
+    case "jotifi_resumen_financiero": {
+      const ctx = await loadUserFinancialContext(idToken, uid, args.month);
       const totalIncome = ctx.globalSections.reduce((acc, s) => acc + (Number(s.income) || 0), 0);
       const totalPlannedExpenses = ctx.globalSections.reduce(
         (acc, s) => acc + (s.expenses || []).reduce((a, e) => a + (Number(e.amount) || 0), 0),
@@ -207,57 +191,204 @@ export function createJotifiMcpServer(getDefaultToken) {
           estado: l.status || "activo"
         }))
       };
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(summaryObj, null, 2)
-          }
-        ]
-      };
+      return JSON.stringify(summaryObj, null, 2);
     }
+
+    case "jotifi_crear_bolsillo": {
+      const ctx = await loadUserFinancialContext(idToken, uid, args.month);
+      const newSec = {
+        id: `sec-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        title: String(args.titulo || "Nuevo Bolsillo").trim(),
+        income: Number(args.ingreso) || 0,
+        expenses: []
+      };
+      const updatedSections = [...ctx.globalSections, newSec];
+      await Promise.all([
+        patchFirestoreDoc(`userData/${uid}/months/${ctx.month}`, { globalSections: updatedSections }, idToken),
+        patchFirestoreDoc(`userData/${uid}`, { latestSections: updatedSections, migratedToMonthly: true }, idToken)
+      ]);
+      return `✅ Bolsillo "${newSec.title}" creado exitosamente en ${ctx.month} con un ingreso de ${formatCOP(newSec.income)} (ID: ${newSec.id}).`;
+    }
+
+    case "jotifi_agregar_gasto_bolsillo": {
+      const ctx = await loadUserFinancialContext(idToken, uid, args.month);
+      if (ctx.globalSections.length === 0) {
+        throw new Error("No tienes bolsillos creados en este mes. Primero crea uno con jotifi_crear_bolsillo.");
+      }
+      const targetQuery = String(args.bolsillo || "").trim().toLowerCase();
+      let matchedSection = ctx.globalSections.find(
+        s => s.id === args.bolsillo || (s.title || "").toLowerCase() === targetQuery || (s.title || "").toLowerCase().includes(targetQuery)
+      );
+      if (!matchedSection) {
+        matchedSection = ctx.globalSections[0];
+      }
+      const newExpense = {
+        id: `exp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        name: String(args.nombreGasto || "Gasto").trim(),
+        amount: Number(args.monto) || 0,
+        day: args.diaVencimiento ? String(args.diaVencimiento) : "",
+        checked: Boolean(args.pagado)
+      };
+      const updatedSections = ctx.globalSections.map(sec =>
+        sec.id === matchedSection.id
+          ? { ...sec, expenses: [...(sec.expenses || []), newExpense] }
+          : sec
+      );
+      await Promise.all([
+        patchFirestoreDoc(`userData/${uid}/months/${ctx.month}`, { globalSections: updatedSections }, idToken),
+        patchFirestoreDoc(`userData/${uid}`, { latestSections: updatedSections }, idToken)
+      ]);
+      return `✅ Gasto "${newExpense.name}" por ${formatCOP(newExpense.amount)} agregado al bolsillo "${matchedSection.title}" (${ctx.month}). Estado: ${newExpense.checked ? "Pagado" : "Pendiente"}.`;
+    }
+
+    case "jotifi_marcar_gasto_pagado": {
+      const ctx = await loadUserFinancialContext(idToken, uid, args.month);
+      const pagado = args.pagado !== undefined ? Boolean(args.pagado) : true;
+      const queryStr = String(args.gasto || "").trim().toLowerCase();
+      let foundExpense = null;
+      let foundSection = null;
+
+      const updatedSections = ctx.globalSections.map(sec => ({
+        ...sec,
+        expenses: (sec.expenses || []).map(exp => {
+          const isMatch =
+            !foundExpense &&
+            (exp.id === args.gasto ||
+              (exp.name || "").toLowerCase() === queryStr ||
+              (exp.name || "").toLowerCase().includes(queryStr));
+          if (isMatch) {
+            foundExpense = { ...exp, checked: pagado };
+            foundSection = sec;
+            return foundExpense;
+          }
+          return exp;
+        })
+      }));
+
+      if (!foundExpense) {
+        throw new Error(`No se encontró ningún gasto que coincida con "${args.gasto}" en el mes ${ctx.month}.`);
+      }
+      await patchFirestoreDoc(`userData/${uid}/months/${ctx.month}`, { globalSections: updatedSections }, idToken);
+      return `✅ El gasto "${foundExpense.name}" (${formatCOP(foundExpense.amount)}) del bolsillo "${foundSection.title}" fue marcado como ${pagado ? "PAGADO ✅" : "PENDIENTE ⏳"}.`;
+    }
+
+    case "jotifi_agregar_deuda": {
+      const ctx = await loadUserFinancialContext(idToken, uid);
+      const newDebt = {
+        id: `debt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        name: String(args.nombre || "Deuda").trim(),
+        totalAmount: Number(args.montoTotal) || 0,
+        monthlyInstallment: Number(args.cuotaMensual) || 0,
+        totalInstallments: Number(args.totalCuotas) || 1,
+        paymentDay: Number(args.diaPago) || 15,
+        interestRate: String(args.tasaInteres || ""),
+        paidAmount: Number(args.montoPagadoInicial) || 0,
+        paidInstallments: 0,
+        priority: "urgente",
+        lastPaymentMonth: null
+      };
+      const updatedDebts = [...ctx.globalDebts, newDebt];
+      await patchFirestoreDoc(`userData/${uid}`, { globalDebts: updatedDebts }, idToken);
+      return `✅ Deuda "${newDebt.name}" por ${formatCOP(newDebt.totalAmount)} (cuota mensual de ${formatCOP(newDebt.monthlyInstallment)}) registrada exitosamente en JotiFi.`;
+    }
+
+    case "jotifi_abonar_deuda": {
+      const ctx = await loadUserFinancialContext(idToken, uid);
+      const esCuotaMensual = args.esCuotaMensual !== undefined ? Boolean(args.esCuotaMensual) : true;
+      const queryStr = String(args.deuda || "").trim().toLowerCase();
+      let updatedDebtItem = null;
+
+      const updatedDebts = ctx.globalDebts.map(d => {
+        const isMatch =
+          !updatedDebtItem &&
+          (d.id === args.deuda ||
+            (d.name || "").toLowerCase() === queryStr ||
+            (d.name || "").toLowerCase().includes(queryStr));
+        if (!isMatch) return d;
+
+        const paymentVal = args.montoAbono !== undefined ? Number(args.montoAbono) : Number(d.monthlyInstallment) || 0;
+        updatedDebtItem = {
+          ...d,
+          paidAmount: (Number(d.paidAmount) || 0) + paymentVal,
+          paidInstallments: esCuotaMensual ? (Number(d.paidInstallments) || 0) + 1 : Number(d.paidInstallments) || 0,
+          lastPaymentMonth: ctx.month
+        };
+        return updatedDebtItem;
+      });
+
+      if (!updatedDebtItem) {
+        throw new Error(`No se encontró ninguna deuda que coincida con "${args.deuda}".`);
+      }
+
+      await patchFirestoreDoc(`userData/${uid}`, { globalDebts: updatedDebts }, idToken);
+      const restante = Math.max(0, (Number(updatedDebtItem.totalAmount) || 0) - (Number(updatedDebtItem.paidAmount) || 0));
+      return `✅ Abono registrado en "${updatedDebtItem.name}". Total pagado: ${formatCOP(updatedDebtItem.paidAmount)} | Saldo pendiente: ${formatCOP(restante)}.`;
+    }
+
+    case "jotifi_agregar_gasto_compartido": {
+      const ctx = await loadUserFinancialContext(idToken, uid);
+      const pagadoPor = String(args.pagadoPor || "Tú").trim();
+      const newExp = {
+        id: `shared-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        description: String(args.descripcion || "Gasto compartido").trim(),
+        amount: Number(args.monto) || 0,
+        paidBy: pagadoPor,
+        category: args.categoria || "Varios",
+        beneficiaries: Array.isArray(args.beneficiarios) && args.beneficiarios.length > 0 ? args.beneficiarios : (ctx.userData.sharedMembers || [pagadoPor]),
+        date: new Date().toISOString(),
+        createdBy: uid
+      };
+      const newList = [newExp, ...ctx.sharedExpenses];
+      if (ctx.activeGroupId) {
+        await patchFirestoreDoc(`groups/${ctx.activeGroupId}/expenses/current`, { list: newList }, idToken);
+      } else {
+        await patchFirestoreDoc(`userData/${uid}`, { sharedExpenses: newList }, idToken);
+      }
+      return `✅ Gasto compartido "${newExp.description}" por ${formatCOP(newExp.amount)} (pagado por ${newExp.paidBy}) registrado en ${ctx.activeGroupName ? `el grupo "${ctx.activeGroupName}"` : "tus gastos compartidos"}.`;
+    }
+
+    default:
+      throw new Error(`Herramienta desconocida: ${toolName}`);
+  }
+}
+
+/**
+ * Crea una instancia del servidor MCP de JotiFi vinculada al token de sesión
+ */
+export function createJotifiMcpServer(getDefaultToken) {
+  const server = new McpServer({
+    name: "jotifi-mcp",
+    version: "1.0.0"
+  });
+
+  function getToken() {
+    return (typeof getDefaultToken === "function" ? getDefaultToken() : getDefaultToken) || process.env.JOTIFI_TOKEN;
+  }
+
+  server.tool(
+    "jotifi_resumen_financiero",
+    "Obtiene el resumen financiero completo del usuario en JotiFi: ingresos mensuales, bolsillos y sus gastos (pagados/pendientes), deudas globales, gastos compartidos y préstamos.",
+    {
+      month: z.string().optional().describe("Mes a consultar en formato YYYY-MM (por defecto el mes actual)")
+    },
+    async (args) => ({
+      content: [{ type: "text", text: await executeJotifiTool("jotifi_resumen_financiero", args, getToken()) }]
+    })
   );
 
-  // 2. Crear o actualizar un Bolsillo
   server.tool(
     "jotifi_crear_bolsillo",
-    "Crea un nuevo bolsillo (sección de presupuesto) en JotiFi o actualiza el ingreso de uno existente.",
+    "Crea un nuevo bolsillo (sección de presupuesto) en JotiFi.",
     {
       titulo: z.string().describe("Nombre del bolsillo (ej. 'Salario Principal', 'Hogar', 'Ahorros')"),
       ingreso: z.number().describe("Monto de ingreso asignado a este bolsillo"),
       month: z.string().optional().describe("Mes en formato YYYY-MM (por defecto el mes actual)")
     },
-    async ({ titulo, ingreso, month }) => {
-      const { idToken, uid } = await resolveSession();
-      const ctx = await loadUserFinancialContext(idToken, uid, month);
-
-      const newSec = {
-        id: `sec-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        title: titulo.trim(),
-        income: Number(ingreso) || 0,
-        expenses: []
-      };
-
-      const updatedSections = [...ctx.globalSections, newSec];
-
-      await Promise.all([
-        patchFirestoreDoc(`userData/${uid}/months/${ctx.month}`, { globalSections: updatedSections }, idToken),
-        patchFirestoreDoc(`userData/${uid}`, { latestSections: updatedSections, migratedToMonthly: true }, idToken)
-      ]);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `✅ Bolsillo "${newSec.title}" creado exitosamente en ${ctx.month} con un ingreso de ${formatCOP(newSec.income)} (ID: ${newSec.id}).`
-          }
-        ]
-      };
-    }
+    async (args) => ({
+      content: [{ type: "text", text: await executeJotifiTool("jotifi_crear_bolsillo", args, getToken()) }]
+    })
   );
 
-  // 3. Agregar gasto a un bolsillo
   server.tool(
     "jotifi_agregar_gasto_bolsillo",
     "Agrega un gasto planeado dentro de un bolsillo de JotiFi (puedes buscar el bolsillo por nombre o ID).",
@@ -269,54 +400,11 @@ export function createJotifiMcpServer(getDefaultToken) {
       pagado: z.boolean().optional().describe("true si ya está pagado, false si está pendiente"),
       month: z.string().optional().describe("Mes en formato YYYY-MM (por defecto el mes actual)")
     },
-    async ({ bolsillo, nombreGasto, monto, diaVencimiento, pagado = false, month }) => {
-      const { idToken, uid } = await resolveSession();
-      const ctx = await loadUserFinancialContext(idToken, uid, month);
-
-      if (ctx.globalSections.length === 0) {
-        throw new Error("No tienes bolsillos creados en este mes. Primero crea uno con jotifi_crear_bolsillo.");
-      }
-
-      const targetQuery = bolsillo.trim().toLowerCase();
-      let matchedSection = ctx.globalSections.find(
-        s => s.id === bolsillo || (s.title || "").toLowerCase() === targetQuery || (s.title || "").toLowerCase().includes(targetQuery)
-      );
-
-      if (!matchedSection) {
-        matchedSection = ctx.globalSections[0];
-      }
-
-      const newExpense = {
-        id: `exp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        name: nombreGasto.trim(),
-        amount: Number(monto) || 0,
-        day: diaVencimiento ? String(diaVencimiento) : "",
-        checked: Boolean(pagado)
-      };
-
-      const updatedSections = ctx.globalSections.map(sec =>
-        sec.id === matchedSection.id
-          ? { ...sec, expenses: [...(sec.expenses || []), newExpense] }
-          : sec
-      );
-
-      await Promise.all([
-        patchFirestoreDoc(`userData/${uid}/months/${ctx.month}`, { globalSections: updatedSections }, idToken),
-        patchFirestoreDoc(`userData/${uid}`, { latestSections: updatedSections }, idToken)
-      ]);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `✅ Gasto "${newExpense.name}" por ${formatCOP(newExpense.amount)} agregado al bolsillo "${matchedSection.title}" (${ctx.month}). Estado: ${newExpense.checked ? "Pagado" : "Pendiente"}.`
-          }
-        ]
-      };
-    }
+    async (args) => ({
+      content: [{ type: "text", text: await executeJotifiTool("jotifi_agregar_gasto_bolsillo", args, getToken()) }]
+    })
   );
 
-  // 4. Marcar o desmarcar un gasto como pagado
   server.tool(
     "jotifi_marcar_gasto_pagado",
     "Marca o desmarca un gasto de un bolsillo como pagado/liquidado en JotiFi.",
@@ -325,49 +413,11 @@ export function createJotifiMcpServer(getDefaultToken) {
       pagado: z.boolean().default(true).describe("true para marcar como pagado, false para marcar como pendiente"),
       month: z.string().optional().describe("Mes en formato YYYY-MM (por defecto el mes actual)")
     },
-    async ({ gasto, pagado = true, month }) => {
-      const { idToken, uid } = await resolveSession();
-      const ctx = await loadUserFinancialContext(idToken, uid, month);
-
-      const queryStr = gasto.trim().toLowerCase();
-      let foundExpense = null;
-      let foundSection = null;
-
-      const updatedSections = ctx.globalSections.map(sec => ({
-        ...sec,
-        expenses: (sec.expenses || []).map(exp => {
-          const isMatch =
-            !foundExpense &&
-            (exp.id === gasto ||
-              (exp.name || "").toLowerCase() === queryStr ||
-              (exp.name || "").toLowerCase().includes(queryStr));
-          if (isMatch) {
-            foundExpense = { ...exp, checked: Boolean(pagado) };
-            foundSection = sec;
-            return foundExpense;
-          }
-          return exp;
-        })
-      }));
-
-      if (!foundExpense) {
-        throw new Error(`No se encontró ningún gasto que coincida con "${gasto}" en el mes ${ctx.month}.`);
-      }
-
-      await patchFirestoreDoc(`userData/${uid}/months/${ctx.month}`, { globalSections: updatedSections }, idToken);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `✅ El gasto "${foundExpense.name}" (${formatCOP(foundExpense.amount)}) del bolsillo "${foundSection.title}" fue marcado como ${pagado ? "PAGADO ✅" : "PENDIENTE ⏳"}.`
-          }
-        ]
-      };
-    }
+    async (args) => ({
+      content: [{ type: "text", text: await executeJotifiTool("jotifi_marcar_gasto_pagado", args, getToken()) }]
+    })
   );
 
-  // 5. Registrar una nueva deuda global
   server.tool(
     "jotifi_agregar_deuda",
     "Registra una nueva deuda o obligación financiera en la sección Deudas de JotiFi.",
@@ -380,39 +430,11 @@ export function createJotifiMcpServer(getDefaultToken) {
       tasaInteres: z.string().optional().default("").describe("Tasa de interés opcional (ej. '1.8%')"),
       montoPagadoInicial: z.number().optional().default(0).describe("Monto ya abonado previamente (opcional)")
     },
-    async ({ nombre, montoTotal, cuotaMensual, totalCuotas = 1, diaPago = 15, tasaInteres = "", montoPagadoInicial = 0 }) => {
-      const { idToken, uid } = await resolveSession();
-      const ctx = await loadUserFinancialContext(idToken, uid);
-
-      const newDebt = {
-        id: `debt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        name: nombre.trim(),
-        totalAmount: Number(montoTotal) || 0,
-        monthlyInstallment: Number(cuotaMensual) || 0,
-        totalInstallments: Number(totalCuotas) || 1,
-        paymentDay: Number(diaPago) || 15,
-        interestRate: String(tasaInteres || ""),
-        paidAmount: Number(montoPagadoInicial) || 0,
-        paidInstallments: 0,
-        priority: "urgente",
-        lastPaymentMonth: null
-      };
-
-      const updatedDebts = [...ctx.globalDebts, newDebt];
-      await patchFirestoreDoc(`userData/${uid}`, { globalDebts: updatedDebts }, idToken);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `✅ Deuda "${newDebt.name}" por ${formatCOP(newDebt.totalAmount)} (cuota mensual de ${formatCOP(newDebt.monthlyInstallment)}) registrada exitosamente en JotiFi.`
-          }
-        ]
-      };
-    }
+    async (args) => ({
+      content: [{ type: "text", text: await executeJotifiTool("jotifi_agregar_deuda", args, getToken()) }]
+    })
   );
 
-  // 6. Abonar a una deuda existente
   server.tool(
     "jotifi_abonar_deuda",
     "Registra el pago de una cuota mensual o un abono extra a capital en una deuda de JotiFi.",
@@ -421,50 +443,11 @@ export function createJotifiMcpServer(getDefaultToken) {
       montoAbono: z.number().optional().describe("Monto a abonar. Si se omite, se abona el valor de 1 cuota mensual fija de esa deuda."),
       esCuotaMensual: z.boolean().optional().default(true).describe("true si suma una cuota pagada, false si es un abono extra a capital")
     },
-    async ({ deuda, montoAbono, esCuotaMensual = true }) => {
-      const { idToken, uid } = await resolveSession();
-      const ctx = await loadUserFinancialContext(idToken, uid);
-
-      const queryStr = deuda.trim().toLowerCase();
-      let updatedDebtItem = null;
-
-      const updatedDebts = ctx.globalDebts.map(d => {
-        const isMatch =
-          !updatedDebtItem &&
-          (d.id === deuda ||
-            (d.name || "").toLowerCase() === queryStr ||
-            (d.name || "").toLowerCase().includes(queryStr));
-        if (!isMatch) return d;
-
-        const paymentVal = montoAbono !== undefined ? Number(montoAbono) : Number(d.monthlyInstallment) || 0;
-        updatedDebtItem = {
-          ...d,
-          paidAmount: (Number(d.paidAmount) || 0) + paymentVal,
-          paidInstallments: esCuotaMensual ? (Number(d.paidInstallments) || 0) + 1 : Number(d.paidInstallments) || 0,
-          lastPaymentMonth: ctx.month
-        };
-        return updatedDebtItem;
-      });
-
-      if (!updatedDebtItem) {
-        throw new Error(`No se encontró ninguna deuda que coincida con "${deuda}".`);
-      }
-
-      await patchFirestoreDoc(`userData/${uid}`, { globalDebts: updatedDebts }, idToken);
-      const restante = Math.max(0, (Number(updatedDebtItem.totalAmount) || 0) - (Number(updatedDebtItem.paidAmount) || 0));
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `✅ Abono registrado en "${updatedDebtItem.name}". Total pagado: ${formatCOP(updatedDebtItem.paidAmount)} | Saldo pendiente: ${formatCOP(restante)}.`
-          }
-        ]
-      };
-    }
+    async (args) => ({
+      content: [{ type: "text", text: await executeJotifiTool("jotifi_abonar_deuda", args, getToken()) }]
+    })
   );
 
-  // 7. Agregar Gasto Compartido
   server.tool(
     "jotifi_agregar_gasto_compartido",
     "Registra un nuevo gasto compartido en el grupo activo del usuario (o en su lista de gastos compartidos).",
@@ -475,38 +458,9 @@ export function createJotifiMcpServer(getDefaultToken) {
       categoria: z.string().optional().default("Varios").describe("Categoría del gasto (ej. 'Comida', 'Hogar', 'Transporte', 'Varios')"),
       beneficiarios: z.array(z.string()).optional().describe("Lista de nombres de quienes se benefician/dividen el gasto (por defecto todos los miembros)")
     },
-    async ({ descripcion, monto, pagadoPor, categoria = "Varios", beneficiarios }) => {
-      const { idToken, uid } = await resolveSession();
-      const ctx = await loadUserFinancialContext(idToken, uid);
-
-      const newExp = {
-        id: `shared-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        description: descripcion.trim(),
-        amount: Number(monto) || 0,
-        paidBy: pagadoPor.trim(),
-        category: categoria,
-        beneficiaries: Array.isArray(beneficiarios) && beneficiarios.length > 0 ? beneficiarios : (ctx.userData.sharedMembers || [pagadoPor.trim()]),
-        date: new Date().toISOString(),
-        createdBy: uid
-      };
-
-      const newList = [newExp, ...ctx.sharedExpenses];
-
-      if (ctx.activeGroupId) {
-        await patchFirestoreDoc(`groups/${ctx.activeGroupId}/expenses/current`, { list: newList }, idToken);
-      } else {
-        await patchFirestoreDoc(`userData/${uid}`, { sharedExpenses: newList }, idToken);
-      }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `✅ Gasto compartido "${newExp.description}" por ${formatCOP(newExp.amount)} (pagado por ${newExp.paidBy}) registrado en ${ctx.activeGroupName ? `el grupo "${ctx.activeGroupName}"` : "tus gastos compartidos"}.`
-          }
-        ]
-      };
-    }
+    async (args) => ({
+      content: [{ type: "text", text: await executeJotifiTool("jotifi_agregar_gasto_compartido", args, getToken()) }]
+    })
   );
 
   return server;

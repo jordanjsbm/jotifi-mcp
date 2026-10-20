@@ -141,11 +141,13 @@ export function toFirestoreValue(val) {
  */
 export async function getFirestoreDoc(docPath, idToken) {
   const cleanPath = docPath.replace(/^\/+/, "");
+  const headers = {};
+  if (idToken) {
+    headers.Authorization = `Bearer ${idToken}`;
+  }
   const res = await fetch(`${FIRESTORE_BASE_URL}/${cleanPath}`, {
     method: "GET",
-    headers: {
-      Authorization: `Bearer ${idToken}`
-    }
+    headers
   });
 
   if (res.status === 404) {

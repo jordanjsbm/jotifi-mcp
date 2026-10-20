@@ -4,10 +4,14 @@ import { randomUUID } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { createJotifiMcpServer } from "./core.js";
+import { registerWhatsAppRoutes } from "./whatsapp-bot.js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Registrar Webhook oficial de WhatsApp Cloud API (Meta)
+registerWhatsAppRoutes(app);
 
 /**
  * Extrae el token personal del usuario desde la URL (?token=jtf_...) o header Authorization
